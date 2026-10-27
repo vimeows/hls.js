@@ -272,10 +272,12 @@ export default class BaseStreamController
       bufferedRanges &&
       bufferedRanges.length > 1
     ) {
-      // make sure bufferInfo accounts for any gaps
+      // make sure bufferInfo accounts for any gaps ahead of the position it was computed at. Measuring
+      // from the start of the range (merged across maxBufferHole) would also find holes that playback
+      // has already passed, and a stale hole behind the playhead must not keep the stream from ending.
       bufferInfo = BufferHelper.bufferedInfo(
         bufferedRanges,
-        bufferInfo.start,
+        bufferInfo.end - bufferInfo.len,
         0,
       );
     }

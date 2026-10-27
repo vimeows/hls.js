@@ -159,6 +159,50 @@ describe('BaseStreamController', function () {
       expect(baseStreamController._streamEnded(bufferInfo, levelDetails)).to.be
         .false;
     });
+
+    describe('with a hole smaller than maxBufferHole', function () {
+      // A 3-frame hole left by a 30fps -> 60fps level switch: 30fps video buffered to frame 178, 60fps
+      // video from frame 362. Exact frame times matter: the hole measures 0.09999999999999964, just
+      // under maxBufferHole (0.1), so it is merged into one range ending at the end of the stream.
+      const ranges = () => [
+        { start: 0, end: 178 / 30 },
+        { start: 362 / 60, end: 49.25 },
+      ];
+      // Buffer info as the stream controllers compute it: at the playhead, merging small holes
+      const fwdBufferInfoAt = (pos: number) => {
+        media.currentTime = pos;
+        return BufferHelper.bufferedInfo(
+          ranges(),
+          pos,
+          hlsDefaultConfig.maxBufferHole,
+        );
+      };
+
+      it('returns true when the hole is behind the playhead', function () {
+        const levelDetails = levelDetailsWithEndSequenceVodOrLive(10);
+        const info = fwdBufferInfoAt(49.19);
+        expect(info.start, 'hole merged into the range').to.equal(0);
+        expect(baseStreamController._streamEnded(info, levelDetails)).to.be
+          .true;
+      });
+
+      it('returns false when the hole is ahead of the playhead', function () {
+        const levelDetails = levelDetailsWithEndSequenceVodOrLive(10);
+        expect(
+          baseStreamController._streamEnded(fwdBufferInfoAt(3), levelDetails),
+        ).to.be.false;
+      });
+
+      it('returns false when the playhead is in the hole', function () {
+        const levelDetails = levelDetailsWithEndSequenceVodOrLive(10);
+        expect(
+          baseStreamController._streamEnded(
+            fwdBufferInfoAt(5.95),
+            levelDetails,
+          ),
+        ).to.be.false;
+      });
+    });
   });
 
   describe('Seeking Logic', function () {
