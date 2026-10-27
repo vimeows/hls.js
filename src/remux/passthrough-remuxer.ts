@@ -12,6 +12,7 @@ import {
   remuxVideoOnlyIFrameMoof,
   videoOnlyInitSegment,
 } from '../utils/mp4-tools';
+import { timestampToString } from '../utils/timescale-conversion';
 import type { HlsConfig } from '../config';
 import type { HlsEventEmitter } from '../events';
 import type { DecryptData } from '../loader/level-key';
@@ -440,6 +441,30 @@ class PassThroughRemuxer extends Logger implements Remuxer {
     const trackId = syncOnAudio ? initData.audio!.id : initData.video!.id;
 
     decodeTime = baseOffsetSamples.start / timescale;
+
+    // A level switch between renditions with different timescales (e.g. 25fps and 50fps video, each
+    // in its own frame-rate timescale) does not by itself make initPTS wrong. Re-deriving initPTS
+    // from this segment's start would move the timeline by any difference between the segment's
+    // decode time and its playlist time (such as the composition offset of a stream with B-frames)
+    // and, through INIT_PTS_FOUND, shift every subsequently appended audio segment by that amount,
+    // leaving a hole in the audio buffer. Keep the same initPTS, expressed in the new timescale.
+    if (
+      initPTS &&
+      timescale !== initPTS.timescale &&
+      !isInvalidInitPts(initPTS, decodeTime, timeOffset, duration)
+    ) {
+      const rescaled = {
+        baseTime: Math.round(
+          (initPTS.baseTime * timescale) / initPTS.timescale,
+        ),
+        timescale,
+        trackId: initPTS.trackId,
+      };
+      this.log(
+        `Rescaled initPTS for track ${trackId} from ${timestampToString(initPTS)} to ${timestampToString(rescaled)}`,
+      );
+      this.initPTS = initPTS = rescaled;
+    }
 
     if (
       (accurateTimeOffset || !initPTS) &&

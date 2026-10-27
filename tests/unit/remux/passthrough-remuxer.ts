@@ -410,6 +410,77 @@ describe('passthrough-remuxer', function () {
       extinfDuration,
     );
   });
+
+  describe('level switch between video timescales', function () {
+    // A 25fps rendition (timescale 25) and a 50fps rendition (timescale 50), both with a 3-frame
+    // composition offset (B-frames). The playlist start of the second 50fps segment is the previous
+    // segment's presentation end, which runs 3 ticks (60ms) ahead of its decode time.
+    function remuxSegment(
+      baseMediaDecodeTime: number,
+      sampleCount: number,
+      timeOffset: number,
+      sn: number,
+    ) {
+      const samples: TrackFragmentSample[] = [];
+      for (let i = 0; i < sampleCount; i++) {
+        samples.push(sample(1, 10, 3));
+      }
+      const fragmentData = appendUint8Array(
+        MP4.moof(sn, baseMediaDecodeTime, { type: 'video', id: 1, samples }),
+        MP4.mdat(new Uint8Array(sampleCount * 10)),
+      );
+      return remuxer.remux(
+        audioTrack(),
+        passthroughTrack(fragmentData),
+        metadataTrack(),
+        userdataTrack(),
+        timeOffset,
+        true,
+        true,
+        PlaylistLevelType.MAIN,
+        new ChunkMetadata(0, sn, 0, fragmentData.byteLength),
+      );
+    }
+
+    function initPtsSeconds(result: ReturnType<typeof remuxSegment>) {
+      const { initPTS, timescale } = result.initSegment!;
+      return initPTS! / timescale!;
+    }
+
+    beforeEach(function () {
+      remuxer.resetInitSegment(
+        MP4.initSegment([videoInitTrack(25)]),
+        undefined,
+        'avc1.42001e',
+        null,
+      );
+      expect(initPtsSeconds(remuxSegment(0, 152, 0, 0))).to.equal(0);
+      remuxer.resetInitSegment(
+        MP4.initSegment([videoInitTrack(50)]),
+        undefined,
+        'avc1.42001e',
+        null,
+      );
+    });
+
+    it('keeps initPTS when only the timescale changes', function () {
+      expect(initPtsSeconds(remuxSegment(302, 302, 6.04, 1))).to.equal(0);
+
+      const second = remuxSegment(604, 301, 12.14, 2);
+      expect(initPtsSeconds(second), 'initPTS (s)').to.equal(0);
+      expect(second.video!.startDTS).to.equal(12.08);
+      // Expressed in the new rendition's timescale, which keyframe PTS math relies on
+      expect(second.initSegment!.timescale).to.equal(50);
+    });
+
+    it('still remaps initPTS when it no longer maps the segment', function () {
+      remuxSegment(302, 302, 6.04, 1);
+
+      const result = remuxSegment(604, 301, 20, 2);
+      expect(initPtsSeconds(result)).to.be.closeTo(-7.92, 1e-9);
+      expect(result.video!.startDTS).to.be.closeTo(20, 1e-9);
+    });
+  });
 });
 
 function markVideoInitSegmentEncrypted(
@@ -450,7 +521,7 @@ function trunSampleDurations(data: Uint8Array): number[] {
   return durations;
 }
 
-function videoInitTrack(): any {
+function videoInitTrack(timescale = 90000): any {
   return {
     codec: 'avc1.42001e',
     dropped: 0,
@@ -466,7 +537,7 @@ function videoInitTrack(): any {
     segmentCodec: 'avc',
     sequenceNumber: 0,
     sps: [new Uint8Array([0x67, 0x42, 0x00, 0x1e, 0xab, 0x40])],
-    timescale: 90000,
+    timescale,
     type: 'video',
     width: 16,
     height: 16,
