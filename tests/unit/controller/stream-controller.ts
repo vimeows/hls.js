@@ -1130,4 +1130,193 @@ describe('StreamController', function () {
       expect(streamController['state']).to.equal(State.IDLE);
     });
   });
+
+  describe('switch hole fill', function () {
+    // Level 0 is a 25fps rendition with 6.08s segments, level 1 a 50fps rendition with 6.04s
+    // segments. Switching 0 -> 1 after the first segment appends level 1's sn 1 (6.04-12.08) over
+    // the end of level 0's sn 0 (0-6.08), which drops the last few frames before 6.04.
+    function makeLevel(levelIndex: number, duration: number, live = false) {
+      const level = new Level({
+        attrs: new AttrList({}),
+        bitrate: 1,
+        name: '',
+        url: '',
+      });
+      const details = new LevelDetails('');
+      details.live = live;
+      details.startSN = 0;
+      for (let sn = 0; sn < 4; sn++) {
+        const frag = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+        frag.sn = sn;
+        frag.level = levelIndex;
+        frag.cc = 0;
+        frag.start = sn * duration;
+        frag.duration = duration;
+        details.fragments.push(frag);
+      }
+      details.endSN = 3;
+      level.details = details;
+      return level;
+    }
+
+    let oldLevel: Level;
+    let newLevel: Level;
+    let media: { currentTime: number; buffered: TimeRangesMock };
+    let bufferedFrags: Array<[number, number, MediaFragment]>;
+
+    function fragOf(level: Level, levelIndex: number, sn: number) {
+      const frag = level.details!.fragments[sn];
+      frag.level = levelIndex;
+      return frag;
+    }
+
+    function setVideoBuffered(...ranges: Array<[number, number]>) {
+      streamController['videoBuffer'] = {
+        buffered: new TimeRangesMock(...ranges),
+      } as any;
+    }
+
+    beforeEach(function () {
+      oldLevel = makeLevel(0, 6.08);
+      newLevel = makeLevel(1, 6.04);
+      streamController['levels'] = [oldLevel, newLevel];
+      media = { currentTime: 1, buffered: new TimeRangesMock() };
+      streamController['media'] = media as any as HTMLMediaElement;
+      setVideoBuffered([0, 5.92], [6.04, 12.08]);
+      // Buffered fragments by the span the tracker matches positions against, newest first
+      bufferedFrags = [
+        [6.04, 12.08, fragOf(newLevel, 1, 1)],
+        [0, 6.08, fragOf(oldLevel, 0, 0)],
+      ];
+      sinon.stub(fragmentTracker, 'getBufferedFrag').callsFake((position) => {
+        for (let i = 0; i < bufferedFrags.length; i++) {
+          const [start, end, frag] = bufferedFrags[i];
+          if (start <= position && position <= end) {
+            return frag;
+          }
+        }
+        return null;
+      });
+      sinon.stub(fragmentTracker, 'getState').returns(FragmentState.NOT_LOADED);
+    });
+
+    afterEach(function () {
+      sinon.restore();
+    });
+
+    const find = () => streamController['findSwitchHoleFill']();
+
+    describe('findSwitchHoleFill', function () {
+      it('returns the previous fragment of the level after a hole a switch left ahead of the playhead', function () {
+        expect(find()).to.equal(newLevel.details!.fragments[0]);
+      });
+
+      it('finds a hole further ahead, past contiguous ranges', function () {
+        media.currentTime = 0;
+        setVideoBuffered([0, 3], [3, 5.92], [6.04, 12.08]);
+        expect(find()).to.equal(newLevel.details!.fragments[0]);
+      });
+
+      it('returns null when the buffer is contiguous', function () {
+        setVideoBuffered([0, 12.08]);
+        expect(find()).to.be.null;
+      });
+
+      it('returns null when the playhead has passed the hole', function () {
+        media.currentTime = 6.05;
+        expect(find()).to.be.null;
+      });
+
+      it('returns null for a hole larger than a few frames', function () {
+        setVideoBuffered([0, 5.4], [6.04, 12.08]);
+        expect(find()).to.be.null;
+      });
+
+      it('returns null when both sides of the hole are the same level', function () {
+        bufferedFrags = [
+          [6.04, 12.08, fragOf(newLevel, 1, 1)],
+          [0, 6.04, fragOf(newLevel, 1, 0)],
+        ];
+        expect(find()).to.be.null;
+      });
+
+      it('returns null when the fragment after the hole does not start at it', function () {
+        bufferedFrags = [
+          [0, 12.08, fragOf(newLevel, 1, 0)],
+          [0, 6.08, fragOf(oldLevel, 0, 0)],
+        ];
+        expect(find()).to.be.null;
+      });
+
+      it('returns null when the previous fragment is already buffered', function () {
+        (fragmentTracker.getState as sinon.SinonStub).returns(FragmentState.OK);
+        expect(find()).to.be.null;
+      });
+
+      it('returns null across a discontinuity', function () {
+        newLevel.details!.fragments[0].cc = 1;
+        expect(find()).to.be.null;
+      });
+
+      it('returns null for live playlists', function () {
+        newLevel = makeLevel(1, 6.04, true);
+        streamController['levels'] = [oldLevel, newLevel];
+        bufferedFrags[0][2] = fragOf(newLevel, 1, 1);
+        expect(find()).to.be.null;
+      });
+
+      it('finds the same fill again after an aborted load, up to the attempt limit', function () {
+        const fill = newLevel.details!.fragments[0];
+        streamController['fillAttempts'].set(fill, 1);
+        expect(find()).to.equal(fill);
+        streamController['fillAttempts'].set(fill, 2);
+        expect(find()).to.be.null;
+      });
+    });
+
+    describe('doTickIdle', function () {
+      beforeEach(function () {
+        streamController['levelLastLoaded'] = oldLevel;
+        sinon.stub(streamController, 'getMainFwdBufferInfo').returns({
+          len: 4.92,
+          start: 0,
+          end: 5.92,
+          nextStart: 6.04,
+          bufferedIndex: 0,
+        });
+        sinon.stub(streamController as any, '_streamEnded').returns(false);
+      });
+
+      it('loads the fill from the level after the hole, even while loading another level', function () {
+        sinon
+          .stub(hls, 'nextLoadLevel')
+          .get(() => 0)
+          .set(() => {});
+        const loadFragment = sinon.stub(
+          streamController as any,
+          'loadFragment',
+        );
+        streamController['doTickIdle']();
+        const fill = newLevel.details!.fragments[0];
+        expect(loadFragment).to.have.been.calledOnceWith(fill, newLevel, 0);
+        expect(streamController['fillAttempts'].get(fill)).to.equal(1);
+      });
+
+      it('loads ahead as usual when there is no hole to fill', function () {
+        setVideoBuffered([0, 12.08]);
+        sinon
+          .stub(hls, 'nextLoadLevel')
+          .get(() => 1)
+          .set(() => {});
+        const loadFragment = sinon.stub(
+          streamController as any,
+          'loadFragment',
+        );
+        streamController['doTickIdle']();
+        expect(loadFragment).to.not.have.been.calledWith(
+          newLevel.details!.fragments[0],
+        );
+      });
+    });
+  });
 });

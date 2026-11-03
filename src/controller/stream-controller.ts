@@ -64,6 +64,13 @@ export const enum AlternateAudio {
 
 const TICK_INTERVAL = 100; // how often to tick in ms
 
+/** How far a fragment's start may be from the end of the hole it follows. @see findSwitchHoleFill */
+const SWITCH_HOLE_START_TOLERANCE = 0.25;
+/** Largest video hole left by a level switch that is filled. @see findSwitchHoleFill */
+const SWITCH_HOLE_MAX_DURATION = 0.5;
+/** Times a fill fragment is loaded before its hole is left to the gap-controller. */
+const SWITCH_HOLE_MAX_FILL_ATTEMPTS = 2;
+
 export default class StreamController
   extends BaseStreamController
   implements NetworkComponentAPI
@@ -76,6 +83,8 @@ export default class StreamController
   private audioOnly: boolean = false;
   private _couldBacktrack: boolean = false;
   private _backtrackFragment: Fragment | undefined = undefined;
+  // Times each fragment has been loaded to fill a level-switch hole. @see findSwitchHoleFill
+  private fillAttempts: WeakMap<MediaFragment, number> = new WeakMap();
   private audioCodecSwitch: boolean = false;
   private videoBuffer: ExtendedSourceBuffer | null = null;
 
@@ -308,6 +317,17 @@ export default class StreamController
       this.level = level;
       this.state = State.WAITING_LEVEL;
       this.startFragRequested = false;
+      return;
+    }
+
+    // Fill a video hole left by a level switch before loading further ahead. @see findSwitchHoleFill
+    const fillFrag = this.findSwitchHoleFill();
+    if (fillFrag) {
+      this.fillAttempts.set(
+        fillFrag,
+        (this.fillAttempts.get(fillFrag) || 0) + 1,
+      );
+      this.loadFragment(fillFrag, levels[fillFrag.level], fillFrag.start);
       return;
     }
 
@@ -576,6 +596,7 @@ export default class StreamController
     this.hls.trigger(Events.BUFFER_RESET, undefined);
     this.couldBacktrack = false;
     this.backtrackFragment = undefined;
+    this.fillAttempts = new WeakMap();
     this.altAudio = AlternateAudio.DISABLED;
     this.audioOnly = false;
   }
@@ -1583,6 +1604,86 @@ export default class StreamController
       return this.config.maxBufferLength;
     }
     return this.getMaxBufferLength(levelInfo.maxBitrate);
+  }
+
+  /**
+   * Finds a fragment to load to fill a small video hole that a level switch left ahead of the
+   * playhead, or null.
+   *
+   * When renditions' segment boundaries don't line up in time (e.g. 25fps segments of 6.08s next to
+   * 50fps segments of 6.04s), a fragment loaded after a switch overlaps the end of what is already
+   * buffered from the other level. Appending it removes the overlapped frames and, with B-frames,
+   * the frames decoded after them up to the next keyframe, so the last few frames shown before the
+   * new fragment's start disappear: a hole of up to a few frames in the video buffer while audio
+   * stays continuous. Browsers handle that badly (Chrome stops rendering video until the playhead is
+   * moved; the gap-controller nudges or skips it, stalling, and because the hole is larger than
+   * maxBufferHole the forward buffer looks starved, prompting a down-switch).
+   *
+   * Loading the previous fragment of the level after the hole replaces the other level's frames up
+   * to exactly where that level's fragment begins, so the buffer becomes contiguous before playback
+   * reaches it. It is chosen by the level of the frames after the hole, not the level being loaded:
+   * the fill repairs what is already buffered. This runs on every tick, so a fill that was aborted,
+   * or a hole recreated by a later re-download, is picked up again; fragments already buffered are
+   * skipped and each fragment is tried at most SWITCH_HOLE_MAX_FILL_ATTEMPTS times.
+   */
+  private findSwitchHoleFill(): MediaFragment | null {
+    const { media, levels, fragmentTracker } = this;
+    if (!media || !levels) {
+      return null;
+    }
+    const buffer = this.videoBuffer || this.mediaBuffer || media;
+    const ranges = BufferHelper.timeRangesToArray(
+      BufferHelper.getBuffered(buffer),
+    );
+    const position = media.currentTime;
+    for (let i = 1; i < ranges.length; i++) {
+      const holeStart = ranges[i - 1].end;
+      const holeEnd = ranges[i].start;
+      if (
+        holeEnd <= position ||
+        holeEnd <= holeStart ||
+        holeEnd - holeStart > SWITCH_HOLE_MAX_DURATION
+      ) {
+        continue;
+      }
+      // The newest fragment just past the hole is the one whose append made it. Its start is its
+      // first presentation time, which can sit a few frames after the hole's end.
+      const after = fragmentTracker.getBufferedFrag(
+        holeEnd + SWITCH_HOLE_START_TOLERANCE,
+        PlaylistLevelType.MAIN,
+      );
+      const before = fragmentTracker.getBufferedFrag(
+        holeStart - 0.001,
+        PlaylistLevelType.MAIN,
+      );
+      if (
+        !after ||
+        !before ||
+        before.level === after.level ||
+        Math.abs(after.start - holeEnd) > SWITCH_HOLE_START_TOLERANCE
+      ) {
+        continue;
+      }
+      const details = levels[after.level]?.details;
+      if (!details || details.live) {
+        continue;
+      }
+      const previous = details.fragments[after.sn - 1 - details.startSN] as
+        | MediaFragment
+        | undefined;
+      if (
+        previous?.cc !== after.cc ||
+        fragmentTracker.getState(previous) === FragmentState.OK ||
+        (this.fillAttempts.get(previous) || 0) >= SWITCH_HOLE_MAX_FILL_ATTEMPTS
+      ) {
+        continue;
+      }
+      this.log(
+        `Level switch left a ${Math.round((holeEnd - holeStart) * 1000)}ms video hole at ${holeStart.toFixed(3)}-${holeEnd.toFixed(3)}, filling it with sn: ${previous.sn} of level ${after.level}`,
+      );
+      return previous;
+    }
+    return null;
   }
 
   private backtrack(frag: Fragment) {
