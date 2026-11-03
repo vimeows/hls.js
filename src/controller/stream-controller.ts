@@ -70,6 +70,12 @@ const SWITCH_HOLE_START_TOLERANCE = 0.25;
 const SWITCH_HOLE_MAX_DURATION = 0.5;
 /** Times a fill fragment is loaded before its hole is left to the gap-controller. */
 const SWITCH_HOLE_MAX_FILL_ATTEMPTS = 2;
+/**
+ * How far around the playhead an append that overwrites another level's frames is assumed to have
+ * landed inside the video decoder's read-ahead. @see flushAfterLateOverlap
+ */
+const DECODER_LOOKAHEAD_BEHIND = 0.5;
+const DECODER_LOOKAHEAD_AHEAD = 1;
 
 export default class StreamController
   extends BaseStreamController
@@ -1002,6 +1008,9 @@ export default class StreamController
           !!frag.gap && !frag.tagList.some((tags) => tags[0] === 'GAP');
       }
       this.fragBufferedComplete(frag, part);
+      if (!fragError && !part && isMediaFragment(frag)) {
+        this.flushAfterLateOverlap(frag);
+      }
       if (fragError) {
         frag.stats.retry++;
         const level = this.levels?.[frag.level];
@@ -1684,6 +1693,48 @@ export default class StreamController
       return previous;
     }
     return null;
+  }
+
+  /**
+   * Flushes the video pipeline when a fragment just appended overwrote frames of another level that
+   * the decoder may already have read.
+   *
+   * When renditions' segment boundaries don't line up in time, a fragment loaded after a level
+   * switch starts before the end of what is buffered from the other level, so appending it replaces
+   * that level's last frames from its own first keyframe on. If that happens within the decoder's
+   * read-ahead of the playhead, the decoder has already consumed the old frames past the new
+   * keyframe and goes on to the new level's frames that depend on it, which it cannot decode: Chrome
+   * holds the last picture until the new level's next keyframe, seconds later, while audio plays on.
+   * A 1µs seek makes it re-read from the new keyframe (the same pipeline flush the gap-controller
+   * uses for video holes).
+   */
+  private flushAfterLateOverlap(frag: MediaFragment) {
+    const media = this.media;
+    // A fill (@see findSwitchHoleFill) rewrites frames from the playhead back, where playback picks
+    // up the new level cleanly; flushing there only adds a stall.
+    if (
+      !media ||
+      media.seeking ||
+      media.paused ||
+      this.fillAttempts.has(frag)
+    ) {
+      return;
+    }
+    const before = this.fragmentTracker.getBufferedFrag(
+      frag.start - 0.001,
+      PlaylistLevelType.MAIN,
+    );
+    if (!before || before.level === frag.level || before.end <= frag.start) {
+      return;
+    }
+    const lead = frag.start - media.currentTime;
+    if (lead < -DECODER_LOOKAHEAD_BEHIND || lead > DECODER_LOOKAHEAD_AHEAD) {
+      return;
+    }
+    this.log(
+      `sn: ${frag.sn} of level ${frag.level} replaced level ${before.level} frames from ${frag.start.toFixed(3)} near the playhead (${media.currentTime.toFixed(3)}), flushing the video pipeline`,
+    );
+    media.currentTime += 0.000001;
   }
 
   private backtrack(frag: Fragment) {

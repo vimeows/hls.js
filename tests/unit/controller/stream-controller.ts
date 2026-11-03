@@ -1319,4 +1319,106 @@ describe('StreamController', function () {
       });
     });
   });
+
+  describe('late overlap flush', function () {
+    // Level 0 (240p, 25fps) is buffered to 24.44; level 1 (1080p, 50fps) sn 4 starting at 24.2 has
+    // just been appended over its tail.
+    let media: { currentTime: number; paused: boolean; seeking: boolean };
+    let before: MediaFragment;
+    let after: MediaFragment;
+
+    function frag(level: number, sn: number, start: number, end: number) {
+      const f = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+      f.level = level;
+      f.sn = sn;
+      f.start = start;
+      f.duration = end - start;
+      return f;
+    }
+
+    beforeEach(function () {
+      media = { currentTime: 23.9, paused: false, seeking: false };
+      streamController['media'] = media as any as HTMLMediaElement;
+      before = frag(0, 3, 18.36, 24.44);
+      after = frag(1, 4, 24.2, 30.24);
+      sinon
+        .stub(fragmentTracker, 'getBufferedFrag')
+        .callsFake((position) =>
+          position >= before.start && position <= before.end ? before : null,
+        );
+    });
+
+    afterEach(function () {
+      sinon.restore();
+    });
+
+    const flush = () => streamController['flushAfterLateOverlap'](after);
+
+    it('flushes the video pipeline when another level was overwritten just ahead of the playhead', function () {
+      flush();
+      expect(media.currentTime).to.be.closeTo(23.900001, 1e-9);
+    });
+
+    it('flushes when the overwrite starts just behind the playhead', function () {
+      media.currentTime = 24.3;
+      flush();
+      expect(media.currentTime).to.be.closeTo(24.300001, 1e-9);
+    });
+
+    it('does not flush when the overwrite is well ahead of the decoder', function () {
+      media.currentTime = 20;
+      flush();
+      expect(media.currentTime).to.equal(20);
+    });
+
+    it('does not flush for an overwrite well behind the playhead', function () {
+      media.currentTime = 25;
+      flush();
+      expect(media.currentTime).to.equal(25);
+    });
+
+    it('does not flush when the frames before it are the same level', function () {
+      before.level = 1;
+      flush();
+      expect(media.currentTime).to.equal(23.9);
+    });
+
+    it('does not flush when nothing was overwritten', function () {
+      before = frag(0, 3, 18.0, 24.2);
+      flush();
+      expect(media.currentTime).to.equal(23.9);
+    });
+
+    it('does not flush after a fill', function () {
+      streamController['fillAttempts'].set(after, 1);
+      flush();
+      expect(media.currentTime).to.equal(23.9);
+    });
+
+    it('does not flush while paused or seeking', function () {
+      media.paused = true;
+      flush();
+      expect(media.currentTime).to.equal(23.9);
+      media.paused = false;
+      media.seeking = true;
+      flush();
+      expect(media.currentTime).to.equal(23.9);
+    });
+
+    it('runs when a main fragment finishes buffering', function () {
+      const check = sinon.stub(
+        streamController as any,
+        'flushAfterLateOverlap',
+      );
+      sinon.stub(streamController as any, 'fragBufferedComplete');
+      sinon.stub(streamController as any, 'fragContextChanged').returns(false);
+      streamController['onFragBuffered'](Events.FRAG_BUFFERED, {
+        stats: new LoadStats(),
+        frag: after,
+        part: null,
+        id: PlaylistLevelType.MAIN,
+      });
+      expect(check).to.have.been.calledOnceWith(after);
+    });
+  });
 });
